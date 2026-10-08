@@ -1,7 +1,7 @@
 """
 Ocean King - Stock Movement Intelligence  (v4)
 
-Improves product visibility from the Swords stock-movement export (SWORDSEXCEL001.csv):
+Improves product visibility from the Swords stock-movement export (any file name, CSV or Excel):
   * Overview            - sales, stock and a "visibility scorecard" (what we can and cannot see)
   * Fast movers         - what sells most, how much stock is left, where it lives
   * Slow movers         - what has stopped or barely sells, cash tied up, who bought it before
@@ -57,9 +57,13 @@ def normalise_bin(raw) -> dict:
     return {"bin_clean": f"{zone}-{no:02d}", "zone": zone, "bin_status": "Valid"}
 
 
-REQUIRED_COLS = ["Move Date", "Move Type", "Invoice no", "Shop name", "Product", "Product Name", "Unit", "Pack", "Quantity",
-                 "Split Quantity", "Weight", "Running Total", "Split Running Total", "Unit Value", "Line Value", "Unit Cost",
-                 "Line Cost", "Bin Locn", "Department", "Customer Category", "Move Time"]
+CORE_COLS = ["Move Date", "Move Type", "Invoice no", "Shop name", "Product", "Product Name", "Quantity", "Running Total",
+             "Line Value", "Line Cost", "Department"]
+# Columns that older / slightly different exports may not have. If missing, they are filled with a safe default
+# and the tool says so, instead of refusing the file.
+OPTIONAL_DEFAULTS = {"Unit": "", "Pack": "1", "Split Quantity": "0", "Weight": "", "Split Running Total": "0", "Unit Value": "",
+                     "Unit Cost": "", "Bin Locn": "", "Customer Category": "", "Move Time": ""}
+REQUIRED_COLS = CORE_COLS + list(OPTIONAL_DEFAULTS)
 
 
 def read_table(raw: bytes, name: str = ""):
@@ -89,14 +93,20 @@ def parse_dates(col: pd.Series):
 def load_movements(raw: bytes, name: str = ""):
     """Returns (clean movements, issues). Broken rows (bad move type, no product, or a 1900 / invalid date) are removed."""
     df, enc = read_table(raw, name)
-    df.columns = [re.sub(r"\s+", " ", c.strip()) for c in df.columns]
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    canon = {c.lower(): c for c in REQUIRED_COLS + ["Line no"]}
+    cleaned = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
+    df.columns = [canon.get(c.lower(), c) for c in cleaned]          # ignores capital letters and extra spaces in headers
+    missing = [c for c in CORE_COLS if c not in df.columns]
     if missing:
-        raise ValueError("This does not look like the Swords stock-movement export (SWORDSEXCEL001). Missing columns: " + ", ".join(missing))
+        raise ValueError("This does not look like a Swords stock-movement export (the file name does not matter, the column headings do). "
+                         "Missing essential columns: " + ", ".join(missing) + ". Columns found: " + ", ".join(cleaned[:25]))
+    miss_opt = [c for c in OPTIONAL_DEFAULTS if c not in df.columns]
+    for c in miss_opt:
+        df[c] = OPTIONAL_DEFAULTS[c]
     df = df.drop(columns=[c for c in df.columns if c.lower() == "line no"])      # never used
     for c in df.columns:
         df[c] = df[c].astype(str).str.strip()
-    issues = {"encoding": enc, "raw_rows": len(df)}
+    issues = {"encoding": enc, "raw_rows": len(df), "missing_optional": miss_opt}
 
     dt, issues["date_format"] = parse_dates(df["Move Date"])
     ok = df["Move Type"].isin(VALID_MOVE_TYPES) & df["Product"].ne("") & dt.notna() & (dt.dt.year > 2000)
@@ -903,8 +913,8 @@ def render_customer(ct, p, sales, issues, labels, rules):
 # App
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner="Reading and cleaning the file…")
-def cached_load(raw: bytes):
-    return load_movements(raw)
+def cached_load(raw: bytes, name: str = ""):
+    return load_movements(raw, name)
 
 
 def main():
@@ -914,16 +924,19 @@ def main():
 
     with st.sidebar:
         st.header("1. File")
-        f = st.file_uploader("Swords movements (SWORDSEXCEL001.csv)", type=["csv"])
+        f = st.file_uploader("Swords stock-movement export (CSV or Excel, any file name)", type=["csv", "CSV", "xlsx", "XLSX", "xlsm", "XLSM"])
     if not f:
-        st.info("👈 Upload the Swords movements CSV to begin.")
+        st.info("👈 Upload the Swords stock-movement export to begin. The file name does not matter: CSV or Excel, new or old data.")
         st.stop()
     try:
-        mov, issues = cached_load(f.getvalue())
+        mov, issues = cached_load(f.getvalue(), getattr(f, "name", ""))
     except Exception as e:
         st.error(f"Could not read the file: {e}")
         st.stop()
 
+    if issues.get("missing_optional"):
+        st.warning("This file has no column(s): " + ", ".join(issues["missing_optional"]) +
+                   ". The tool filled them with defaults, so views that depend on them (bins, customer categories, time of day, catch-weight items) will be limited.")
     with st.sidebar:
         st.header("2. Scope")
         jh_prod = mov["Product Name"].str.contains("JH Storage", case=False, na=False)
