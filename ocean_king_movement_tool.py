@@ -66,6 +66,13 @@ OPTIONAL_DEFAULTS = {"Unit": "", "Pack": "1", "Split Quantity": "0", "Weight": "
 REQUIRED_COLS = CORE_COLS + list(OPTIONAL_DEFAULTS)
 
 
+class MissingColumns(ValueError):
+    """Raised when essential columns are missing; carries what is missing and what was found so the app can ask the user."""
+    def __init__(self, missing, found, message):
+        super().__init__(message)
+        self.missing, self.found = missing, found
+
+
 def read_table(raw: bytes, name: str = ""):
     """Reads the Swords movement export as CSV or Excel (.xlsx)."""
     if name.lower().endswith((".xlsx", ".xlsm", ".xls")):
@@ -90,16 +97,22 @@ def parse_dates(col: pd.Series):
     return best[1], {"%m/%d/%Y": "month/day/year", "%d/%m/%Y": "day/month/year", "%Y-%m-%d": "year-month-day"}[best_fmt]
 
 
-def load_movements(raw: bytes, name: str = ""):
+def load_movements(raw: bytes, name: str = "", mapping=None):
     """Returns (clean movements, issues). Broken rows (bad move type, no product, or a 1900 / invalid date) are removed."""
     df, enc = read_table(raw, name)
     canon = {c.lower(): c for c in REQUIRED_COLS + ["Line no"]}
     cleaned = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
     df.columns = [canon.get(c.lower(), c) for c in cleaned]          # ignores capital letters and extra spaces in headers
+    for tgt, src in (mapping or {}).items():                           # columns the user matched by hand
+        if src == "(leave blank)":
+            df[tgt] = ""
+        elif src in df.columns:
+            df[tgt] = df[src]
     missing = [c for c in CORE_COLS if c not in df.columns]
     if missing:
-        raise ValueError("This does not look like a Swords stock-movement export (the file name does not matter, the column headings do). "
-                         "Missing essential columns: " + ", ".join(missing) + ". Columns found: " + ", ".join(cleaned[:25]))
+        raise MissingColumns(missing, cleaned,
+                             "This does not look like a Swords stock-movement export (the file name does not matter, the column headings do). "
+                             "Missing essential columns: " + ", ".join(missing) + ". Columns found: " + ", ".join(cleaned[:60]))
     miss_opt = [c for c in OPTIONAL_DEFAULTS if c not in df.columns]
     for c in miss_opt:
         df[c] = OPTIONAL_DEFAULTS[c]
@@ -913,8 +926,35 @@ def render_customer(ct, p, sales, issues, labels, rules):
 # App
 # ----------------------------------------------------------------------------
 @st.cache_data(show_spinner="Reading and cleaning the file…")
-def cached_load(raw: bytes, name: str = ""):
-    return load_movements(raw, name)
+def cached_load(raw: bytes, name: str = "", mapping=()):
+    return load_movements(raw, name, dict(mapping))
+
+
+@st.cache_data(show_spinner=False)
+def peek_file(raw: bytes, name: str = ""):
+    df, _ = read_table(raw, name)
+    return df.head(8)
+
+
+def ask_mapping(f, e):
+    """Shown when a file uses different column names: the user says which column is which, once."""
+    st.warning("This file uses different column names from the newer Swords export. Tell the tool which of your columns is which. "
+               "You only do this once for this file.")
+    head = peek_file(f.getvalue(), getattr(f, "name", ""))
+    st.caption("First rows of your file:")
+    st.dataframe(head, use_container_width=True)
+    hints = {"Invoice no": "the invoice or document number", "Shop name": "the customer / shop name",
+             "Line Cost": "the cost of goods on the line", "Line Value": "the sales value of the line",
+             "Department": "the department code (1 frozen, 2 ambient, 3 chilled)", "Running Total": "stock after each movement"}
+    chosen = {}
+    for tgt in e.missing:
+        chosen[tgt] = st.selectbox(f'Which column is "{tgt}"? ({hints.get(tgt, "")})', ["(choose a column)", "(leave blank)"] + list(e.found), key=f"map_{tgt}")
+    if all(v != "(choose a column)" for v in chosen.values()):
+        if st.button("Use these columns"):
+            st.session_state["colmap"] = {"key": (getattr(f, "name", ""), len(f.getvalue())), "map": chosen}
+            (getattr(st, "rerun", None) or st.experimental_rerun)()
+    else:
+        st.info("Choose a column for each item above, or '(leave blank)' if the file does not have it. Leaving 'Invoice no' blank means order counts will not be meaningful.")
 
 
 def main():
@@ -929,7 +969,12 @@ def main():
         st.info("👈 Upload the Swords stock-movement export to begin. The file name does not matter: CSV or Excel, new or old data.")
         st.stop()
     try:
-        mov, issues = cached_load(f.getvalue(), getattr(f, "name", ""))
+        cm = st.session_state.get("colmap")
+        mp = tuple(sorted(cm["map"].items())) if cm and cm.get("key") == (getattr(f, "name", ""), len(f.getvalue())) else ()
+        mov, issues = cached_load(f.getvalue(), getattr(f, "name", ""), mp)
+    except MissingColumns as e:
+        ask_mapping(f, e)
+        st.stop()
     except Exception as e:
         st.error(f"Could not read the file: {e}")
         st.stop()
